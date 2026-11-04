@@ -1,6 +1,29 @@
 {
   "name": "flight-shield",
   "version": "3.0.0",
+  "description": "Zero-dependency toolkit to prevent thundering herds, cache stampedes, and redundant API calls — SingleFlight, StampedeShield, and BatchFlight for Node.js.",
+  "keywords": [
+    "singleflight",
+    "thundering-herd",
+    "cache-stampede",
+    "batching",
+    "dataloader",
+    "deduplication",
+    "coalescing",
+    "request-coalescing",
+    "concurrency",
+    "backend",
+    "performance"
+  ],
+  "homepage": "https://github.com/mayankcodes-dev/flight-shield#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mayankcodes-dev/flight-shield.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mayankcodes-dev/flight-shield/issues"
+  },
+  "author": "Mayank",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -22,7 +45,9 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",

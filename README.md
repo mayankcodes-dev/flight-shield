@@ -1,26 +1,38 @@
 <p align="center">
-  <img src="./assets/flight-shield-logo.svg" alt="flight-shield logo" width="144" />
+  <img src="./assets/logo.png" alt="flight-shield" width="140" />
 </p>
 
 <h1 align="center">flight-shield</h1>
 
-<p align="center">Keep duplicate work away from your database, APIs, and caches.</p>
-
 <p align="center">
-  Zero runtime dependencies · Node.js 20+ · ESM + CommonJS · MIT
+  Stop your server from doing the same work twice.
 </p>
 
-`flight-shield` is a small TypeScript toolkit for one common backend problem: many requests ask for the same data at the same time.
+<p align="center">
+  <a href="https://www.npmjs.com/package/flight-shield"><img src="https://img.shields.io/npm/v/flight-shield?color=6366f1&label=npm" alt="npm version"/></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D20-blue" alt="node 20+"/>
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"/>
+  <img src="https://img.shields.io/badge/zero-dependencies-orange" alt="zero dependencies"/>
+  <img src="https://img.shields.io/badge/TypeScript-ready-3178c6" alt="TypeScript"/>
+</p>
 
-## The three tools
+---
 
-| Tool | Use it when | Result |
-| --- | --- | --- |
-| `SingleFlight` | Several callers need the same key now | One upstream operation, many waiters |
-| `StampedeShield` | A cached value needs safe refresh | Fresh, stale, and background refresh states |
-| `BatchFlight` | Your upstream accepts many keys at once | A short window of keys becomes one batch |
+## What problem does this solve?
 
-Without coordination, 100 requests can create 100 database calls. That is a **thundering herd**. When an item expires and every request refills it independently, it is a **cache stampede**.
+Imagine 100 users request the same product page at the same moment. Without `flight-shield`, your server fires 100 database queries for the same row. With it — just one.
+
+This is called a **thundering herd**, and it's one of the most common causes of unexpected database overload in real apps.
+
+`flight-shield` gives you three weapons to fight it:
+
+| Tool | What it does |
+|------|-------------|
+| **SingleFlight** | If 100 requests need the same key, run the fetch **once** and share the result |
+| **StampedeShield** | Wrap your cache so it never floods your DB when a cached value expires |
+| **BatchFlight** | Collect individual lookups into a single batch request automatically |
+
+---
 
 ## Install
 
@@ -29,171 +41,182 @@ npm install flight-shield
 ```
 
 ```ts
+// ESM
 import { singleFlight } from 'flight-shield';
-```
 
-```js
+// CommonJS
 const { singleFlight } = require('flight-shield');
 ```
 
-The default `singleFlight` instance is shared by ESM and CommonJS imports in the same process through `Symbol.for('flight-shield.default')`.
+No configuration needed. It works out of the box.
 
-## 1. SingleFlight
+---
 
-Use a stable key. Concurrent calls with that key share one promise.
+## Tool 1 — SingleFlight
+
+> **"100 requests, 1 database call."**
+
+When many requests arrive for the same key at the same time, `SingleFlight` lets only **one** through. The rest wait and share the result.
 
 ```ts
 import { singleFlight } from 'flight-shield';
 
 const user = await singleFlight.do(
-  `user:${userId}`,
-  (signal) => fetch(`https://users.internal/${userId}`, { signal }).then((response) => {
-    if (!response.ok) throw new Error(`User service returned ${response.status}`);
-    return response.json() as Promise<{ id: string; name: string }>;
-  }),
-  { timeoutMs: 2_000, clone: true },
+  `user:${userId}`,                              // unique key
+  (signal) => fetchUserFromDB(userId, signal),   // the real work
+  { timeoutMs: 2_000, clone: true },             // options
 );
 ```
 
-`clone: true` gives each caller a separate `structuredClone`. This prevents one request from mutating the object seen by another request.
+That's it. If 50 requests come in for `user:42` while the fetch is running, they all receive the same result — but the database is only called once.
 
-For function wrappers, `wrap` uses `serializeKey(args)` by default:
+**`clone: true`** gives each caller their own copy so they can't accidentally modify each other's data.
+
+### Wrap a function
 
 ```ts
 const getUser = singleFlight.wrap(
-  async (tenantId: string, id: string) => loadUser(tenantId, id),
-  { keyFn: (tenantId, id) => `${tenantId}:user:${id}`, clone: true },
+  async (id: string) => fetchUserFromDB(id),
+  { keyFn: (id) => `user:${id}`, clone: true },
 );
+
+// Now safe to call from anywhere — deduped automatically
+const user = await getUser('42');
 ```
 
-## 2. StampedeShield (v2.0)
+---
 
-`StampedeShield` adds cache behavior around a loader:
+## Tool 2 — StampedeShield
 
-1. **Fresh value:** return it immediately.
-2. **XFetch refresh:** sometimes refresh a fresh value early, without making the caller wait.
-3. **Stale-while-revalidate:** after `ttlMs`, serve the old value while one refresh runs.
-4. **Hard miss:** use `SingleFlight`, so concurrent cold misses call the loader once.
+> **"Your cache expires. Don't let 100 requests hit your DB at once."**
+
+When a cached item expires, every concurrent request rushes to refill it — a **cache stampede**. `StampedeShield` prevents this by:
+
+1. Serving **fresh** values instantly
+2. Serving **stale** values while refreshing in the background (zero wait)
+3. Only running **one refresh** even if hundreds of requests arrive at the same time
 
 ```ts
 import { MemoryCacheAdapter, StampedeShield } from 'flight-shield';
 
-type Product = { id: string; price: number };
-const shield = new StampedeShield<Product>(new MemoryCacheAdapter(10_000));
+const shield = new StampedeShield(new MemoryCacheAdapter(10_000));
 
 const product = await shield.getOrSet(
   'product:42',
-  (signal) => fetchProduct('42', signal),
+  (signal) => fetchProductFromDB('42', signal),
   {
-    ttlMs: 30_000,
-    staleTtlMs: 120_000,
-    beta: 1,
-    timeoutMs: 2_000,
+    ttlMs: 30_000,       // fresh for 30 seconds
+    staleTtlMs: 120_000, // serve stale for up to 2 minutes while refreshing
     clone: true,
-    onBackgroundError: (error, key) => logger.warn({ error, key }),
   },
 );
 ```
 
-`MemoryCacheAdapter` is bounded and LRU. For Redis or another shared cache, implement the small `CacheAdapter<T>` interface. The shield itself is process-local; use a distributed lock when refreshes must coordinate across pods.
+**`MemoryCacheAdapter`** is an in-process LRU cache (bounded). For Redis or another shared store, implement the small `CacheAdapter<T>` interface with `get` and `set` methods.
 
-## 3. BatchFlight (v3.0)
+---
 
-`BatchFlight` collects keys for a short window and sends unique keys to a batch endpoint. It flushes when the window ends or the batch reaches `maxBatchSize`.
+## Tool 3 — BatchFlight
+
+> **"Stop calling your API one item at a time."**
+
+Instead of 50 separate `GET /user/1`, `GET /user/2`… calls, `BatchFlight` automatically groups individual `.load()` calls into a single batch request.
 
 ```ts
 import { BatchFlight } from 'flight-shield';
 
-type User = { id: number; name: string };
-
 const users = new BatchFlight<number, User>(
   async (ids, signal) => {
-    const response = await fetch('https://users.internal/batch', {
+    // Called once with [1, 2, 3, ...] instead of one-by-one
+    const res = await fetch('/api/users/batch', {
       method: 'POST',
       body: JSON.stringify({ ids }),
       signal,
     });
-    return (await response.json()) as User[];
+    return res.json(); // return array in same order as ids
   },
-  { maxBatchSize: 50, maxWindowMs: 10, timeoutMs: 1_000 },
+  { maxBatchSize: 50, maxWindowMs: 10 }, // collect for 10ms then flush
 );
 
-const [one, two] = await Promise.all([users.load(1), users.load(2)]);
+// These three calls become ONE batch request
+const [alice, bob, carol] = await Promise.all([
+  users.load(1),
+  users.load(2),
+  users.load(3),
+]);
 ```
 
-The batch loader can return:
-
-- an array in the exact order of the unique input keys; or
-- a `ReadonlyMap` keyed by the input keys.
-
-An array length mismatch rejects every call in that batch. An `Error` result rejects only that key. `loadMany` keeps item errors in their original positions:
+You can also load many keys at once and get per-item errors without crashing the whole batch:
 
 ```ts
 const results = await users.loadMany([1, 2, 3]);
-// [User, Error, User]
+// results[1] could be an Error — the other items still resolve fine
 ```
 
-## Backend examples
+---
 
-### Express
+## Real-world examples
+
+### Express route
 
 ```ts
-app.get('/users/:id', async (request, response, next) => {
+app.get('/users/:id', async (req, res, next) => {
   try {
     const user = await singleFlight.do(
-      `user:${request.params.id}`,
-      (signal) => fetchUser(request.params.id, signal),
+      `user:${req.params.id}`,
+      (signal) => fetchUser(req.params.id, signal),
       { timeoutMs: 2_000, clone: true },
     );
-    response.json(user);
-  } catch (error) {
-    next(error);
+    res.json(user);
+  } catch (err) {
+    next(err);
   }
 });
 ```
 
-### Prisma or Drizzle
+### Prisma / Drizzle ORM
 
 ```ts
 export function getUser(id: string) {
   return singleFlight.do(
     `db:user:${id}`,
-    async () => prisma.user.findUnique({ where: { id } }),
+    () => prisma.user.findUnique({ where: { id } }),
     { timeoutMs: 1_500, clone: true },
   );
 }
 ```
-
-The timeout releases waiting callers. Configure the database driver's own timeout when the query library does not accept an `AbortSignal`.
 
 ### Redis cache-aside
 
 ```ts
 const getProduct = singleFlight.wrap(
   async (id: string) => {
-    const key = `product:${id}`;
-    const cached = await redis.get(key);
-    if (cached) return JSON.parse(cached) as Product;
-
-    const product = await loadProductFromDatabase(id);
-    await redis.set(key, JSON.stringify(product), 'EX', 60);
+    const cached = await redis.get(`product:${id}`);
+    if (cached) return JSON.parse(cached);
+    const product = await db.products.find(id);
+    await redis.set(`product:${id}`, JSON.stringify(product), 'EX', 60);
     return product;
   },
-  { keyFn: (id) => `product:${id}`, clone: true },
+  { keyFn: (id) => `product:${id}` },
 );
 ```
 
-This protects cache misses inside one Node process. Redis locks are needed for cross-process stampede protection.
+---
 
-## Deterministic keys
+## Deterministic key serialization
 
-`serializeKey(value)` handles primitives, arrays, sorted plain-object keys, `Date`, `RegExp`, `BigInt`, `Map`, `Set`, and circular references.
+`serializeKey` turns any value into a consistent string key — even objects with keys in different order.
 
 ```ts
+import { serializeKey } from 'flight-shield';
+
 serializeKey({ b: 2, a: 1 }) === serializeKey({ a: 1, b: 2 }); // true
 serializeKey(new Set(['b', 'a'])) === serializeKey(new Set(['a', 'b'])); // true
-serializeKey(123n); // includes "123n"
 ```
+
+Handles: primitives, arrays, plain objects, `Date`, `RegExp`, `BigInt`, `Map`, `Set`, circular references.
+
+---
 
 ## Benchmark
 
@@ -201,71 +224,63 @@ serializeKey(123n); // includes "123n"
 npm run bench
 ```
 
-The benchmark compares 200 concurrent callers doing a simulated 10 ms operation:
+| Scenario | DB calls for 200 concurrent requests | Memory |
+|----------|-----------------------------------:|-------:|
+| No protection | **200** | +215 KiB |
+| With `SingleFlight` | **1** | +137 KiB |
 
-| Scenario | Upstream executions in one burst | Approx. heap delta |
-| --- | ---: | ---: |
-| Without coalescing | 200 | +215 KiB |
-| With `SingleFlight` | 1 | +137 KiB |
-
-Numbers vary by machine and garbage-collection timing. The important result is the upstream work: one shared flight replaces 200 duplicate calls.
+---
 
 ## API reference
 
-### Package exports
-
-| Export | Purpose |
-| --- | --- |
-| `BatchFlight<K, V>` | Adaptive time-window and size-based micro-batching. |
-| `BatchOptions<K>` | Batch size, window, serializer, and timeout settings. |
-| `CacheAdapter<T>` | Storage interface for `StampedeShield`. |
-| `MemoryCacheAdapter<T>` | Bounded in-memory LRU adapter. |
-| `serializeKey` | Deterministic key serializer. |
-| `SingleFlight` | Isolated in-flight registry. |
-| `singleFlight` / `defaultSingleFlight` | Process-wide shared registry. |
-| `FlightOptions<T>` / `FlightResult<T>` | Single-flight settings and metadata. |
-| `StampedeShield<T>` | XFetch and stale-while-revalidate cache wrapper. |
-| `ShieldEnvelope<T>` / `ShieldOptions<T>` | Shield storage metadata and settings. |
-
 ### SingleFlight
 
-| Member | Signature | What it does |
-| --- | --- | --- |
-| `do` | `<T>(key, fn, options?) => Promise<T>` | Join or start one operation. |
-| `doWithMeta` | `<T>(key, fn, options?) => Promise<FlightResult<T>>` | Also returns `shared` and `coalescedCount`. |
-| `wrap` | `<Args, T>(fn, options?) => (...args: Args) => Promise<T>` | Create a keyed coalescing function. |
-| `forget` | `(key) => boolean` | Evict and abort a current flight. |
-| `inFlightCount` | `number` | Current number of registered keys. |
+| Method | What it does |
+|--------|-------------|
+| `singleFlight.do(key, fn, options?)` | Deduplicate concurrent calls by key |
+| `singleFlight.doWithMeta(key, fn, options?)` | Same, but also returns `shared` and `coalescedCount` |
+| `singleFlight.wrap(fn, options?)` | Wrap a function to auto-deduplicate by args |
+| `singleFlight.forget(key)` | Abort and evict a running flight |
+| `singleFlight.inFlightCount` | How many keys are currently in-flight |
 
-`FlightOptions<T>` supports `timeoutMs`, `clone`, and `maxFlightWindowMs`.
+**Options:** `timeoutMs`, `clone`, `maxFlightWindowMs`
+
+---
 
 ### StampedeShield
 
-| Member | Signature | What it does |
-| --- | --- | --- |
-| constructor | `new StampedeShield<T>(cache?, singleFlight?)` | Configure storage and an optional isolated registry. |
-| `getOrSet` | `(key, loader, options?) => Promise<T>` | Read fresh/stale data or coalesce a loader. |
-| `MemoryCacheAdapter` | `new MemoryCacheAdapter<T>(maxEntries?)` | Bounded LRU storage; default capacity is 1,000. |
+| Method | What it does |
+|--------|-------------|
+| `new StampedeShield(cache?, sf?)` | Create a shield with optional cache adapter |
+| `shield.getOrSet(key, loader, options?)` | Get from cache or run loader (deduplicated) |
+| `new MemoryCacheAdapter(maxEntries?)` | Bounded LRU cache (default 1,000 entries) |
 
-`ShieldOptions<T>` supports `ttlMs` (default 60 seconds), `staleTtlMs` (default 0), `beta` (default 1), `timeoutMs`, `clone`, `maxFlightWindowMs`, and `onBackgroundError`.
+**Options:** `ttlMs` (60s), `staleTtlMs` (0), `beta` (1), `timeoutMs`, `clone`, `onBackgroundError`
+
+---
 
 ### BatchFlight
 
-| Member | Signature | What it does |
-| --- | --- | --- |
-| constructor | `new BatchFlight<K, V>(batchFn, options?)` | Create a batch coordinator. |
-| `load` | `(key: K) => Promise<V>` | Queue one key and return its value. |
-| `loadMany` | `(keys: readonly K[]) => Promise<Array<V \| Error>>` | Queue many keys and preserve order. |
+| Method | What it does |
+|--------|-------------|
+| `new BatchFlight(batchFn, options?)` | Create a batch coordinator |
+| `batch.load(key)` | Queue a single key — resolves when the batch fires |
+| `batch.loadMany(keys[])` | Queue many keys — returns `Array<Value \| Error>` |
 
-`BatchOptions<K>` supports `maxBatchSize` (default 50), `maxWindowMs` (default 10), `keySerializer`, and `timeoutMs`.
+**Options:** `maxBatchSize` (50), `maxWindowMs` (10ms), `keySerializer`, `timeoutMs`
 
-## Failure behavior
+---
 
-- Loader failures reject all callers waiting on that flight or batch.
-- A timeout aborts the signal and releases the waiting callers.
-- `StampedeShield` keeps stale data when a background refresh fails and calls `onBackgroundError`.
-- `BatchFlight` rejects only keys whose result is an `Error`; an array alignment failure rejects the whole batch.
-- All registries are process-local. Use shared coordination for multiple workers or pods.
+## Error behavior
+
+- If the loader throws, **all** callers waiting on that flight get the error
+- A timeout aborts the signal and rejects all waiting callers
+- `StampedeShield` keeps serving stale data if a background refresh fails
+- `BatchFlight` per-item errors only reject that key, not the whole batch
+
+> **Note:** Everything here is process-local. For multi-pod/worker setups, pair with Redis locks for distributed coordination.
+
+---
 
 ## Development
 
@@ -276,3 +291,9 @@ npm test
 npm run bench
 npm run check:exports
 ```
+
+---
+
+## License
+
+MIT © Mayank

@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="fs-title fs-desc">
+  <title id="fs-title">flight-shield</title>
+  <desc id="fs-desc">flight-shield official logo — a gradient shield containing a lightning bolt with speed lines</desc>
+  <defs>
+    <!-- Main shield gradient: blue → violet -->
+    <linearGradient id="g-shield" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#3B82F6"/>
+      <stop offset="50%"  stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <!-- Inner glow / shine -->
+    <linearGradient id="g-shine" x1="0%" y1="0%" x2="60%" y2="100%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Drop shadow filter -->
+    <filter id="f-shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="18" flood-color="#7C3AED" flood-opacity="0.45"/>
+    </filter>
+    <!-- Glow filter for inner icons -->
+    <filter id="f-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="clip-shield">
+      <path d="M256 32 L444 100 L444 230 C444 352 356 438 256 476 C156 438 68 352 68 230 L68 100 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Shield base with shadow -->
+  <path
+    d="M256 32 L444 100 L444 230 C444 352 356 438 256 476 C156 438 68 352 68 230 L68 100 Z"
+    fill="url(#g-shield)"
+    filter="url(#f-shadow)"
+  />
+
+  <!-- Shield inner stroke -->
+  <path
+    d="M256 54 L422 114 L422 230 C422 338 342 414 256 450 C170 414 90 338 90 230 L90 114 Z"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-opacity="0.18"
+    stroke-width="4"
+  />
+
+  <!-- Shine overlay clipped to shield -->
+  <path
+    d="M256 32 L444 100 L444 230 C444 352 356 438 256 476 C156 438 68 352 68 230 L68 100 Z"
+    fill="url(#g-shine)"
+    clip-path="url(#clip-shield)"
+  />
+
+  <!-- Speed lines (3 arcs, left side) -->
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-opacity="0.55">
+    <path d="M128 210 Q160 230 128 250" stroke-width="10"/>
+    <path d="M110 196 Q155 230 110 264" stroke-width="7"/>
+    <path d="M 96 182 Q 152 230  96 278" stroke-width="5"/>
+  </g>
+
+  <!-- Speed lines (3 arcs, right side) — mirrored -->
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-opacity="0.55">
+    <path d="M384 210 Q352 230 384 250" stroke-width="10"/>
+    <path d="M402 196 Q357 230 402 264" stroke-width="7"/>
+    <path d="M416 182 Q360 230 416 278" stroke-width="5"/>
+  </g>
+
+  <!-- Lightning bolt (centered, crisp) -->
+  <path
+    d="M278 110 L180 258 L242 258 L212 390 L332 218 L266 218 L298 110 Z"
+    fill="#FFFFFF"
+    filter="url(#f-glow)"
+  />
+</svg>
