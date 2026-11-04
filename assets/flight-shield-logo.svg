@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">flight-shield logo</title>
+  <desc id="desc">A blue shield containing a white flight path and lightning bolt.</desc>
+  <defs>
+    <linearGradient id="shield" x1="88" y1="48" x2="424" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#36C5F0"/>
+      <stop offset="0.48" stop-color="#3978F6"/>
+      <stop offset="1" stop-color="#6947D8"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="152" y1="92" x2="350" y2="354" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <path d="M256 28 454 98v137c0 123-76 209-198 249C134 444 58 358 58 235V98L256 28Z" fill="url(#shield)"/>
+  <path d="M256 48 432 110v125c0 108-64 185-176 225-112-40-176-117-176-225V110L256 48Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="8"/>
+  <path d="M94 117 256 60v363c-103-38-162-108-162-188V117Z" fill="url(#shine)"/>
+  <path d="m287 104-126 183h83l-22 126 127-198h-84l22-111Z" fill="#FFFFFF"/>
+  <path d="M116 318c37-5 69-17 96-36M396 318c-37-5-69-17-96-36" fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-opacity="0.9" stroke-width="12"/>
+  <circle cx="116" cy="318" r="8" fill="#FFFFFF"/>
+  <circle cx="396" cy="318" r="8" fill="#FFFFFF"/>
+</svg>
