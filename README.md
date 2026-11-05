@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/logo.png" alt="flight-shield" width="128" />
+  <img src="./assets/logo.svg" alt="flight-shield" width="128" />
 </p>
 
 <h1 align="center">flight-shield</h1>
