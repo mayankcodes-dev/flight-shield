@@ -1,6 +1,6 @@
 {
   "name": "flight-shield",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Zero-dependency toolkit to prevent thundering herds, cache stampedes, and redundant API calls — SingleFlight, StampedeShield, and BatchFlight for Node.js.",
   "keywords": [
     "singleflight",
