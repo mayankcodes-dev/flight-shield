@@ -18,7 +18,7 @@
   "homepage": "https://github.com/mayankcodes-dev/flight-shield#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mayankcodes-dev/flight-shield.git"
+    "url": "git+https://github.com/mayankcodes-dev/flight-shield.git"
   },
   "bugs": {
     "url": "https://github.com/mayankcodes-dev/flight-shield/issues"
@@ -53,7 +53,8 @@
     "build": "tsup",
     "test": "vitest run",
     "bench": "npm run build && node benchmarks/coalesce.bench.mjs",
-    "check:exports": "npm pack && npx publint && npx @arethetypeswrong/cli --pack",
+    "check:exports": "npx publint --pack false",
+    "check:types": "node scripts/check-exports.mjs",
     "prepublishOnly": "npm run build && npm run test && npm run check:exports"
   },
   "devDependencies": {
