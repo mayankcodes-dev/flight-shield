@@ -157,6 +157,11 @@ export class BatchFlight<K, V> {
       this.flushTimer = undefined;
       this.flush();
     }, this.maxWindowMs);
+
+    // P1 fix: unref so the timer doesn't keep CLI/test processes alive
+    if (typeof this.flushTimer === 'object' && this.flushTimer !== null && 'unref' in this.flushTimer) {
+      (this.flushTimer as { unref(): void }).unref();
+    }
   }
 
   private flush(): void {

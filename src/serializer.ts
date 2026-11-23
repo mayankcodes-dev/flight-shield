@@ -3,10 +3,6 @@ type SerializerContext = {
   nextReference: number;
 };
 
-function isObjectLike(value: unknown): value is object {
-  return (typeof value === 'object' && value !== null) || typeof value === 'function';
-}
-
 function quote(value: string): string {
   return JSON.stringify(value);
 }
