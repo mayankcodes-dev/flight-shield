@@ -96,6 +96,11 @@ export class BatchFlight<K, V> {
   }
 
   async loadMany(keys: readonly K[]): Promise<Array<V | Error>> {
+    // Bug 3.3 fix: Short-circuit empty input — no timer, no batchFn invocation.
+    if (keys.length === 0) {
+      return [];
+    }
+
     const entries = keys.map((key) => this.enqueue(key));
     return Promise.all(
       entries.map((entry) =>
@@ -215,7 +220,9 @@ export class BatchFlight<K, V> {
 
       for (const entry of entries) {
         if (!serializedResults.has(entry.serializedKey)) {
-          entry.reject(new Error(`Batch loader did not return a value for key ${entry.serializedKey}`));
+          // Bug 3.2 fix: Use resolveEntry so missing keys become per-item
+          // errors in loadMany() instead of crashing the entire batch.
+          this.resolveEntry(entry, new Error(`Batch loader did not return a value for key ${entry.serializedKey}`));
           continue;
         }
         this.resolveEntry(entry, serializedResults.get(entry.serializedKey)!);
