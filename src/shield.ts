@@ -1,6 +1,20 @@
 import type { FlightOptions } from './singleflight.js';
 import { defaultSingleFlight, SingleFlight } from './singleflight.js';
 
+/**
+ * Envelope stored inside a CacheAdapter.
+ *
+ * - `value`       – the cached payload.
+ * - `deltaMs`     – how long the previous loader took (ms). Used by XFetch (beta).
+ * - `expiry`      – soft expiry (Date.now() + ttlMs).  After this, data is "stale".
+ * - `staleExpiry` – hard expiry (expiry + staleTtlMs). After this, data is gone.
+ *
+ * **For adapter authors:** When persisting to Redis or another external store,
+ * set the **physical key TTL** (e.g. Redis `PX`) to the `pxMs` argument of
+ * `CacheAdapter.set()`, **not** `envelope.expiry`.  `pxMs` already equals
+ * `ttlMs + staleTtlMs`, i.e. the total time the entry must remain stored so
+ * that the stale-serving window works correctly.
+ */
 export interface ShieldEnvelope<T> {
   value: T;
   deltaMs: number;
@@ -10,6 +24,16 @@ export interface ShieldEnvelope<T> {
 
 type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * CacheAdapter — the contract custom cache backends must implement.
+ *
+ * `pxMs` in `set()` is the **hard storage lifetime** in milliseconds
+ * (= `ttlMs + staleTtlMs`).  Use this — not `envelope.expiry` — when setting
+ * the physical TTL on your store (e.g. `await redis.set(key, json, 'PX', pxMs)`).
+ * `envelope.expiry` is the *soft* expiry used internally by StampedeShield to
+ * decide when data becomes stale; the entry must stay alive in the store for
+ * the full `pxMs` window so stale-serving can work.
+ */
 export interface CacheAdapter<T> {
   get(key: string): MaybePromise<ShieldEnvelope<T> | null | undefined>;
   set(key: string, envelope: ShieldEnvelope<T>, pxMs: number): MaybePromise<void>;
@@ -176,8 +200,12 @@ export class StampedeShield<T> {
 
     if (envelope !== null && envelope !== undefined) {
       if (now < envelope.expiry) {
+        // Bug 2.2 fix: Clamp Math.random() away from 0 so Math.log() never
+        // returns -Infinity, and clamp deltaMs so 0 * -Infinity never yields NaN.
+        const safeRandom = Math.max(Number.EPSILON, Math.random());
+        const safeDelta  = Math.max(1, envelope.deltaMs);
         const shouldRefresh =
-          now - envelope.deltaMs * normalized.beta * Math.log(Math.random()) >= envelope.expiry;
+          now - safeDelta * normalized.beta * Math.log(safeRandom) >= envelope.expiry;
 
         if (shouldRefresh) {
           this.startBackgroundRefresh(key, loader, normalized);
@@ -245,7 +273,9 @@ export class StampedeShield<T> {
   ): Promise<T> {
     const startedAt = performance.now();
     const value = await loader(signal);
-    const deltaMs = performance.now() - startedAt;
+    // Bug 2.2 fix: Clamp deltaMs to at least 1ms so XFetch never gets
+    // 0 * Math.log(x) = NaN for sub-millisecond loaders.
+    const deltaMs = Math.max(1, performance.now() - startedAt);
     const expiry = Date.now() + options.ttlMs;
     const envelope: ShieldEnvelope<T> = {
       value,
