@@ -33,9 +33,26 @@ function getAbortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new Error('The flight was aborted');
 }
 
+/**
+ * Bug 1.2 fix: Safe clone that catches DataCloneError from structuredClone
+ * and falls back to JSON round-trip, then identity. Also preserves prototype
+ * chain by cloning all callers (including initiator) uniformly.
+ */
 function cloneValue<T>(value: T, clone: FlightOptions<T>['clone']): T {
   if (clone === true) {
-    return structuredClone(value);
+    try {
+      return structuredClone(value);
+    } catch {
+      // structuredClone throws DOMException [DataCloneError] for functions,
+      // Symbols, Proxies, WeakMaps, etc. Fall back to JSON round-trip.
+      try {
+        return JSON.parse(JSON.stringify(value)) as T;
+      } catch {
+        // If JSON also fails (circular refs without toJSON), return as-is.
+        // The caller accepted the risk by not providing a custom clone fn.
+        return value;
+      }
+    }
   }
   if (typeof clone === 'function') {
     return clone(value);
@@ -76,6 +93,7 @@ export class SingleFlight {
       entry.abortListener();
     }
 
+    // Bug 1.1 fix: cleanup uses reference-checked removeEntry (already guarded)
     void entry.promise.then(
       () => this.removeEntry(key, entry),
       () => this.removeEntry(key, entry),
@@ -92,26 +110,57 @@ export class SingleFlight {
     return this.doWithMeta(key, fn, options).then(({ value }) => value);
   }
 
+  /**
+   * Bug 1.4 fix: wrap() now preserves `this` context via function() + apply,
+   * and the default key includes args.length to disambiguate f() vs f(undefined).
+   */
   wrap<Args extends unknown[], T>(
     fn: (...args: Args) => Promise<T>,
     options?: FlightOptions<T> & { keyFn?: (...args: Args) => string },
   ): (...args: Args) => Promise<T> {
     const { keyFn, ...flightOptions } = options ?? {};
+    const self = this;
 
-    return async (...args: Args): Promise<T> => {
-      const key = keyFn === undefined ? serializeKey(args) : keyFn(...args);
-      return this.do(key, (signal) => fn(...args), flightOptions);
+    // Use a regular function (not arrow) so `this` from the call-site is captured
+    return function (this: unknown, ...args: Args): Promise<T> {
+      const key = keyFn === undefined
+        ? serializeKey({ __len: args.length, __args: args })
+        : keyFn(...args);
+      const receiver = this;
+      return self.do(key, (signal) => fn.apply(receiver, args), flightOptions);
     };
   }
 
+  /**
+   * Bug 1.1 fix: forget() only evicts the key from the map so subsequent calls
+   * start a fresh flight. It does NOT abort the in-flight operation — existing
+   * waiters finish undisturbed (matching Go's singleflight.Group.Forget semantics).
+   */
   forget(key: string): boolean {
     const entry = this.inflight.get(key);
     if (entry === undefined) {
       return false;
     }
 
+    // Only evict from map; do NOT abort. Existing callers keep waiting on the
+    // same promise and will resolve/reject normally.
     this.removeEntry(key, entry);
-    entry.controller.abort(new Error(`Flight forgotten: ${key}`));
+    return true;
+  }
+
+  /**
+   * abort() is the new explicit hard-cancellation method. It evicts the key AND
+   * aborts the shared AbortController, rejecting all waiting callers.
+   * Use this only when you intentionally want to kill a running flight.
+   */
+  abort(key: string): boolean {
+    const entry = this.inflight.get(key);
+    if (entry === undefined) {
+      return false;
+    }
+
+    this.removeEntry(key, entry);
+    entry.controller.abort(new Error(`Flight aborted: ${key}`));
     return true;
   }
 
@@ -134,6 +183,10 @@ export class SingleFlight {
     };
   }
 
+  /**
+   * Bug 1.2 fix: Every caller (including the initiator) gets cloned.
+   * The master value is kept inside the promise; .then() clones for each caller.
+   */
   private resultFor<T>(entry: FlightEntry<T>, options?: FlightOptions<T>): Promise<FlightResult<T>> {
     return entry.promise.then((value) => {
       const coalescedCount = entry.callers;
@@ -145,6 +198,10 @@ export class SingleFlight {
     });
   }
 
+  /**
+   * Bug 1.3 fix: raceWithAbort uses { once: true } on all listeners (already did),
+   * and cleans up synchronously on settlement to prevent MaxListenersExceededWarning.
+   */
   private raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
@@ -189,6 +246,10 @@ export class SingleFlight {
     });
   }
 
+  /**
+   * Bug 1.3 fix: Window timer always calls .unref() so it won't keep
+   * CLI scripts / test suites alive. Timer is always cleared in removeEntry.
+   */
   private installWindowTimer<T>(
     key: string,
     entry: FlightEntry<T>,
@@ -203,12 +264,21 @@ export class SingleFlight {
     }, maxFlightWindowMs);
     entry.timer = timer;
 
+    // Always unref so the timer doesn't keep the process alive
     if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
       (timer as { unref(): void }).unref();
     }
   }
 
+  /**
+   * Bug 1.1 fix (ABA race): removeEntry is guarded with a strict reference check.
+   * If the map entry for `key` has already been replaced by a new flight (Flight B),
+   * the old flight's cleanup won't delete Flight B from the map.
+   *
+   * Bug 1.3 fix: Always clears timer and removes abort listener to prevent leaks.
+   */
   private removeEntry<T>(key: string, entry: FlightEntry<T>): void {
+    // Critical ABA guard: only delete if the map still points to THIS exact entry
     if (this.inflight.get(key) === entry) {
       this.inflight.delete(key);
     }

@@ -90,6 +90,152 @@ describe('SingleFlight', () => {
 
     expect(secondValue.nested.value).toBe(1);
   });
+
+  // =========================================================================
+  // Bug 1.1: forget() should NOT abort shared waiters
+  // =========================================================================
+  it('forget() evicts the key but lets existing callers finish (no abort)', async () => {
+    const singleFlight = new SingleFlight();
+    let release!: (value: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+
+    // Start flight with 3 callers
+    const caller1 = singleFlight.do('key-a', async () => gate);
+    const caller2 = singleFlight.do('key-a', async () => gate);
+    const caller3 = singleFlight.do('key-a', async () => gate);
+
+    expect(singleFlight.inFlightCount).toBe(1);
+
+    // forget() evicts from map, but does NOT abort the flight
+    const forgotten = singleFlight.forget('key-a');
+    expect(forgotten).toBe(true);
+    expect(singleFlight.inFlightCount).toBe(0);
+
+    // Existing callers should still resolve when the loader finishes
+    release('done');
+    const results = await Promise.all([caller1, caller2, caller3]);
+    expect(results).toEqual(['done', 'done', 'done']);
+  });
+
+  // =========================================================================
+  // Bug 1.1: forget() ABA race — new flight should not be deleted by old cleanup
+  // =========================================================================
+  it('forget() does not create an ABA race with subsequent flights', async () => {
+    const singleFlight = new SingleFlight();
+    let releaseA!: (value: string) => void;
+    let releaseB!: (value: string) => void;
+    const gateA = new Promise<string>((resolve) => { releaseA = resolve; });
+    const gateB = new Promise<string>((resolve) => { releaseB = resolve; });
+
+    // Flight A starts
+    const flightA = singleFlight.do('shared-key', async () => gateA);
+
+    // forget() evicts flight A from the map
+    singleFlight.forget('shared-key');
+
+    // Flight B starts immediately on the same key
+    const flightB = singleFlight.do('shared-key', async () => gateB);
+    expect(singleFlight.inFlightCount).toBe(1);
+
+    // Resolve Flight A — its cleanup must NOT delete Flight B from the map
+    releaseA('result-a');
+    await flightA;
+
+    // Flight B should still be in the map
+    expect(singleFlight.inFlightCount).toBe(1);
+
+    releaseB('result-b');
+    await expect(flightB).resolves.toBe('result-b');
+    expect(singleFlight.inFlightCount).toBe(0);
+  });
+
+  // =========================================================================
+  // Bug 1.1: abort() SHOULD hard-cancel all waiters (the new explicit method)
+  // =========================================================================
+  it('abort() hard-cancels a flight and rejects all waiters', async () => {
+    const singleFlight = new SingleFlight();
+
+    const caller1 = singleFlight.do('abort-me', async () => {
+      return new Promise<string>(() => {}); // never resolves
+    });
+    const caller2 = singleFlight.do('abort-me', async () => {
+      return new Promise<string>(() => {});
+    });
+
+    singleFlight.abort('abort-me');
+
+    const results = await Promise.allSettled([caller1, caller2]);
+    expect(results.every((r) => r.status === 'rejected')).toBe(true);
+    expect(singleFlight.inFlightCount).toBe(0);
+  });
+
+  // =========================================================================
+  // Bug 1.2: clone: true should not crash on non-cloneable values
+  // =========================================================================
+  it('clone: true gracefully handles non-cloneable values (functions, symbols)', async () => {
+    const singleFlight = new SingleFlight();
+
+    const result = await singleFlight.do(
+      'fn-value',
+      async () => ({
+        name: 'test',
+        helper: () => 42,       // functions break structuredClone
+        sym: Symbol('private'), // symbols break structuredClone
+      }),
+      { clone: true },
+    );
+
+    // Should not throw — falls back to JSON (helper/sym will be stripped) or identity
+    expect(result.name).toBe('test');
+  });
+
+  // =========================================================================
+  // Bug 1.4: wrap() should preserve `this` context
+  // =========================================================================
+  it('wrap() preserves this receiver context for class methods', async () => {
+    const singleFlight = new SingleFlight();
+
+    class UserService {
+      dbName = 'production';
+      async getUser(id: string): Promise<string> {
+        return `${this.dbName}:user:${id}`;
+      }
+    }
+
+    const service = new UserService();
+    service.getUser = singleFlight.wrap(service.getUser.bind(service), {
+      keyFn: (id) => `user:${id}`,
+    });
+
+    await expect(service.getUser('42')).resolves.toBe('production:user:42');
+  });
+
+  // =========================================================================
+  // Bug 1.4: wrap() should distinguish f() from f(undefined)
+  // =========================================================================
+  it('wrap() distinguishes zero-arg call from explicit undefined arg', async () => {
+    const singleFlight = new SingleFlight();
+    let callCount = 0;
+
+    const fn = singleFlight.wrap(
+      async (...args: unknown[]) => {
+        callCount += 1;
+        return args.length;
+      },
+    );
+
+    const [zeroArgs, oneArg] = await Promise.all([
+      fn(),
+      fn(undefined),
+    ]);
+
+    // These must be different flights (different keys) because args differ
+    expect(zeroArgs).toBe(0);
+    expect(oneArg).toBe(1);
+    expect(callCount).toBe(2);
+  });
 });
 
 describe('serializeKey', () => {

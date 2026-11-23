@@ -48,9 +48,21 @@ function validateDuration(name: string, value: number | undefined): void {
   }
 }
 
+/**
+ * Bug 1.2 fix: Safe clone that catches DataCloneError from structuredClone
+ * and falls back to JSON round-trip, then identity.
+ */
 function cloneValue<T>(value: T, clone: ShieldOptions<T>['clone']): T {
   if (clone === true) {
-    return structuredClone(value);
+    try {
+      return structuredClone(value);
+    } catch {
+      try {
+        return JSON.parse(JSON.stringify(value)) as T;
+      } catch {
+        return value;
+      }
+    }
   }
   if (typeof clone === 'function') {
     return clone(value);
