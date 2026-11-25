@@ -10,6 +10,7 @@
   <a href="https://www.npmjs.com/package/flight-shield"><img src="https://img.shields.io/npm/v/flight-shield?color=22c55e&label=npm" alt="npm"/></a>
   <img src="https://img.shields.io/badge/node-%3E%3D20-333" alt="node"/>
   <img src="https://img.shields.io/badge/zero-dependencies-orange" alt="zero deps"/>
+  <img src="https://img.shields.io/badge/tests-63%20passing-brightgreen" alt="tests"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"/>
 </p>
 
@@ -76,13 +77,101 @@ const product = await shield.getOrSet(
 );
 ```
 
-For Redis or any shared store — implement the two-method `CacheAdapter<T>` interface:
+### `shouldCache` — skip caching bad values
+
+Prevent cache penetration: bots or bad inputs that always miss will hammer your DB if `null` results get cached with a full TTL.
 
 ```ts
+const user = await shield.getOrSet(`user:${id}`, () => db.getUser(id), {
+  ttlMs: 60_000,
+  shouldCache: (value) => value !== null, // null/miss results are NOT cached
+});
+// → next call for the same missing user hits the loader again, not stale null
+```
+
+### Dynamic `ttlMs` — different TTL based on the value
+
+```ts
+const user = await shield.getOrSet(`user:${id}`, () => db.getUser(id), {
+  // Cache null for 5s (miss), real objects for 5min
+  ttlMs: (value) => value === null ? 5_000 : 300_000,
+  staleTtlMs: 120_000,
+});
+```
+
+Returning `0` from the function skips caching entirely for that call.
+
+### `waitUntil` — keep background refreshes alive on serverless
+
+Vercel, Cloudflare Workers, and Next.js App Router **kill background promises** the moment the HTTP response is sent. Without `waitUntil`, your SWR refresh silently dies mid-flight.
+
+```ts
+// Next.js App Router
+import { unstable_after as waitUntil } from 'next/server';
+
+const data = await shield.getOrSet(`feed`, () => fetchFeed(), {
+  ttlMs: 60_000,
+  staleTtlMs: 300_000,
+  waitUntil, // ← hands the refresh promise to Next.js to keep alive
+});
+
+// Cloudflare Workers
+export default {
+  fetch(request, env, ctx) {
+    const shield = new StampedeShield(cache);
+    return shield.getOrSet(`key`, loader, {
+      ttlMs: 60_000,
+      waitUntil: ctx.waitUntil.bind(ctx), // ← Cloudflare ctx.waitUntil
+    });
+  },
+};
+```
+
+### `softPurge` — stampede-safe cache invalidation
+
+After a DB mutation, `cache.delete(key)` removes the entry entirely. The next burst of readers all miss simultaneously and stampede the DB.
+
+`softPurge` zeroes out only the *fresh* window while keeping the *stale* window alive. The next read returns the stale value instantly and kicks off exactly **one** background refresh.
+
+```ts
+// ❌ Wrong — causes stampede on the next burst
+await db.updateProduct(id, data);
+await cache.delete(`product:${id}`);
+
+// ✅ Right — serves stale instantly, refreshes once in background
+await db.updateProduct(id, data);
+await shield.softPurge(`product:${id}`);
+```
+
+`softPurge` on a key that doesn't exist or whose stale window has expired is a safe no-op.
+
+### Redis adapter
+
+Implement the two-method `CacheAdapter<T>` interface to plug in any store:
+
+```ts
+import { createClient } from 'redis';
+import type { CacheAdapter, ShieldEnvelope } from 'flight-shield';
+
+const redis = createClient();
+
 class RedisAdapter<T> implements CacheAdapter<T> {
-  async get(key: string) { /* return { value, expiresAt } or undefined */ }
-  async set(key: string, envelope: ShieldEnvelope<T>) { /* store it */ }
+  async get(key: string): Promise<ShieldEnvelope<T> | undefined> {
+    const raw = await redis.get(key);
+    return raw ? JSON.parse(raw) : undefined;
+  }
+
+  async set(key: string, envelope: ShieldEnvelope<T>, pxMs: number): Promise<void> {
+    // pxMs = ttlMs + staleTtlMs — the total physical lifetime needed
+    await redis.set(key, JSON.stringify(envelope), { PX: pxMs });
+  }
+
+  async delete(key: string): Promise<void> {
+    await redis.del(key);
+  }
 }
+
+const shield = new StampedeShield(new RedisAdapter());
 ```
 
 ---
@@ -125,6 +214,8 @@ serializeKey({ b: 2, a: 1 }) === serializeKey({ a: 1, b: 2 }); // true
 serializeKey(new Set(['b', 'a'])) === serializeKey(new Set(['a', 'b'])); // true
 ```
 
+Handles: `BigInt`, `Date`, `RegExp`, `Set`, `Map`, circular references, `NaN`, `Infinity`, `null`, `undefined`, `Symbol`.
+
 ---
 
 ## Benchmark
@@ -149,7 +240,8 @@ Run it: `npm run bench`
 | `singleFlight.do(key, fn, opts?)` | Deduplicate by key |
 | `singleFlight.doWithMeta(key, fn, opts?)` | Also returns `shared`, `coalescedCount` |
 | `singleFlight.wrap(fn, opts?)` | Auto-keyed wrapper function |
-| `singleFlight.forget(key)` | Abort + evict a running flight |
+| `singleFlight.forget(key)` | Evict key, let existing callers finish |
+| `singleFlight.abort(key)` | Hard-cancel flight, reject all waiters |
 
 Options: `timeoutMs`, `clone`, `maxFlightWindowMs`
 
@@ -159,8 +251,9 @@ Options: `timeoutMs`, `clone`, `maxFlightWindowMs`
 |--------|-------------|
 | `new StampedeShield(cache?, sf?)` | Create shield |
 | `shield.getOrSet(key, loader, opts?)` | Cached, coalesced, stale-aware fetch |
+| `shield.softPurge(key)` | Stampede-safe invalidation after mutations |
 
-Options: `ttlMs`, `staleTtlMs`, `beta`, `timeoutMs`, `clone`, `onBackgroundError`
+Options: `ttlMs`, `staleTtlMs`, `beta`, `timeoutMs`, `clone`, `onBackgroundError`, `shouldCache`, `waitUntil`
 
 ### BatchFlight
 
@@ -181,7 +274,7 @@ Options: `maxBatchSize` (50), `maxWindowMs` (10ms), `keySerializer`, `timeoutMs`
 - **StampedeShield background refresh fails** → keeps serving stale, calls `onBackgroundError`
 - **BatchFlight item fails** → only that key rejects, rest resolve fine
 
-> Everything is process-local. For multi-pod setups, pair with distributed locks.
+> Everything is process-local. For multi-pod setups, pair with a distributed lock or Redis.
 
 ---
 
