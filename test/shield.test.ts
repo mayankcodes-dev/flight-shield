@@ -503,3 +503,248 @@ describe('StampedeShield', () => {
     expect(cache.get('exp-b')).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// New feature tests: shouldCache, waitUntil, dynamic ttlMs, softPurge
+// ---------------------------------------------------------------------------
+
+describe('shouldCache', () => {
+  it('skips caching when shouldCache returns false, still returns the value', async () => {
+    const cache = new MemoryCacheAdapter<string | null>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+
+    const result = await shield.getOrSet(
+      'miss-key',
+      async () => { calls++; return null; },
+      { ttlMs: 10_000, shouldCache: (v) => v !== null },
+    );
+
+    expect(result).toBeNull();      // value is still returned to caller
+    expect(calls).toBe(1);
+    expect(cache.size).toBe(0);    // nothing stored
+  });
+
+  it('caches when shouldCache returns true', async () => {
+    const cache = new MemoryCacheAdapter<string | null>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+
+    const result = await shield.getOrSet(
+      'hit-key',
+      async () => { calls++; return 'real-value'; },
+      { ttlMs: 10_000, shouldCache: (v) => v !== null },
+    );
+
+    expect(result).toBe('real-value');
+    expect(calls).toBe(1);
+    expect(cache.size).toBe(1);    // stored
+  });
+
+  it('calls loader again on the second call when shouldCache returned false the first time', async () => {
+    const cache = new MemoryCacheAdapter<null>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+
+    await shield.getOrSet('k', async () => { calls++; return null; }, {
+      ttlMs: 10_000,
+      shouldCache: () => false,
+    });
+    await shield.getOrSet('k', async () => { calls++; return null; }, {
+      ttlMs: 10_000,
+      shouldCache: () => false,
+    });
+
+    expect(calls).toBe(2); // loader invoked twice — nothing was cached
+  });
+});
+
+describe('waitUntil', () => {
+  it('passes the background refresh promise to waitUntil', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    const captured: Promise<unknown>[] = [];
+
+    // Prime the cache with a stale entry (expiry = 0)
+    const staleEnv = {
+      value: 'stale',
+      deltaMs: 1,
+      expiry: Date.now() - 1,
+      staleExpiry: Date.now() + 10_000,
+    };
+    cache.set('wk', staleEnv, 10_000);
+
+    const result = await shield.getOrSet(
+      'wk',
+      async () => 'fresh',
+      {
+        ttlMs: 10_000,
+        staleTtlMs: 10_000,
+        waitUntil: (p) => captured.push(p),
+      },
+    );
+
+    expect(result).toBe('stale');         // stale value returned immediately
+    expect(captured).toHaveLength(1);     // background promise handed to waitUntil
+    await captured[0];                    // let the refresh complete
+    // After the refresh the cache should hold the fresh value
+    const updated = await cache.get('wk');
+    expect(updated?.value).toBe('fresh');
+  });
+
+  it('does not call waitUntil when there is no background refresh', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    const captured: Promise<unknown>[] = [];
+
+    // Fresh cache hit — no background refresh needed
+    const freshEnv = {
+      value: 'fresh',
+      deltaMs: 1,
+      expiry: Date.now() + 60_000,
+      staleExpiry: Date.now() + 120_000,
+    };
+    cache.set('fk', freshEnv, 120_000);
+
+    await shield.getOrSet('fk', async () => 'new', {
+      ttlMs: 60_000,
+      staleTtlMs: 60_000,
+      waitUntil: (p) => captured.push(p),
+    });
+
+    expect(captured).toHaveLength(0);
+  });
+});
+
+describe('dynamic ttlMs', () => {
+  it('uses a short TTL for null values and long TTL for real values', async () => {
+    const cache = new MemoryCacheAdapter<string | null>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+
+    // Store a null result — should get short TTL
+    await shield.getOrSet('null-key', async () => null, {
+      ttlMs: (v) => (v === null ? 100 : 60_000),
+    });
+    const nullEntry = await cache.get('null-key');
+    expect(nullEntry).not.toBeUndefined();
+    // expiresAt should be within ~100ms window
+    const nowAfterNull = Date.now();
+    expect(nullEntry!.expiry).toBeLessThanOrEqual(nowAfterNull + 110);
+    expect(nullEntry!.expiry).toBeGreaterThan(nowAfterNull - 10);
+
+    // Store a real result — should get long TTL
+    await shield.getOrSet('real-key', async () => 'data', {
+      ttlMs: (v) => (v === null ? 100 : 60_000),
+    });
+    const realEntry = await cache.get('real-key');
+    expect(realEntry).not.toBeUndefined();
+    expect(realEntry!.expiry).toBeGreaterThan(Date.now() + 50_000);
+  });
+
+  it('dynamic ttlMs returning 0 skips caching entirely', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+
+    await shield.getOrSet('skip-key', async () => { calls++; return 'v'; }, {
+      ttlMs: () => 0,
+    });
+    await shield.getOrSet('skip-key', async () => { calls++; return 'v'; }, {
+      ttlMs: () => 0,
+    });
+
+    expect(calls).toBe(2);         // nothing cached → loader called twice
+    expect(cache.size).toBe(0);
+  });
+
+  it('throws RangeError for a dynamic ttlMs that returns a negative number', async () => {
+    const shield = new StampedeShield(new MemoryCacheAdapter(), new SingleFlight());
+
+    await expect(
+      shield.getOrSet('bad', async () => 'v', { ttlMs: () => -1 }),
+    ).rejects.toThrow(RangeError);
+  });
+});
+
+describe('softPurge', () => {
+  it('marks an entry as stale without removing it, so the next read gets the stale value', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+
+    // Load once to populate cache
+    await shield.getOrSet('pk', async () => { calls++; return 'v1'; }, {
+      ttlMs: 60_000,
+      staleTtlMs: 60_000,
+    });
+    expect(calls).toBe(1);
+
+    // Soft-purge
+    await shield.softPurge('pk');
+
+    // Entry is still in cache but marked stale (expiry = 0)
+    const purged = await cache.get('pk');
+    expect(purged).not.toBeUndefined();
+    expect(purged!.expiry).toBe(0);
+    expect(purged!.value).toBe('v1'); // stale value still present
+  });
+
+  it('next getOrSet after softPurge returns stale value and triggers background refresh', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+    let calls = 0;
+    const waitedPromises: Promise<unknown>[] = [];
+
+    await shield.getOrSet('pk2', async () => { calls++; return 'v1'; }, {
+      ttlMs: 60_000,
+      staleTtlMs: 60_000,
+    });
+
+    await shield.softPurge('pk2');
+
+    // Should return stale 'v1' immediately, kick off one refresh
+    const result = await shield.getOrSet('pk2', async () => { calls++; return 'v2'; }, {
+      ttlMs: 60_000,
+      staleTtlMs: 60_000,
+      waitUntil: (p) => waitedPromises.push(p),
+    });
+
+    expect(result).toBe('v1');           // stale value served immediately
+    // loader has been called once for initial load + once for background refresh
+    // (the refresh starts synchronously when stale is detected)
+    if (waitedPromises.length > 0) {
+      await waitedPromises[0];           // let refresh complete
+    } else {
+      await delay(50);
+    }
+
+    expect(calls).toBe(2);              // initial load + background refresh
+    // After refresh, cache should have the new value
+    const refreshed = await cache.get('pk2');
+    expect(refreshed?.value).toBe('v2');
+  });
+
+  it('softPurge on a non-existent key is a no-op', async () => {
+    const shield = new StampedeShield(new MemoryCacheAdapter(), new SingleFlight());
+    await expect(shield.softPurge('no-such-key')).resolves.toBeUndefined();
+  });
+
+  it('softPurge on an expired stale entry deletes it rather than re-storing', async () => {
+    const cache = new MemoryCacheAdapter<string>();
+    const shield = new StampedeShield(cache, new SingleFlight());
+
+    // Manually insert an entry whose stale window has already passed
+    const expiredEnv = {
+      value: 'old',
+      deltaMs: 1,
+      expiry: Date.now() - 200,
+      staleExpiry: Date.now() - 100, // already expired
+    };
+    cache.set('expired', expiredEnv, 50_000); // physical TTL is generous
+
+    await shield.softPurge('expired');
+
+    // Should have been deleted (remainingPxMs === 0)
+    expect(cache.size).toBe(0);
+  });
+});

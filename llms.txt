@@ -1,0 +1,79 @@
+# flight-shield
+
+> Zero-dependency Node.js / TypeScript library for request coalescing, cache-stampede prevention, and adaptive micro-batching.
+
+## What it does
+
+flight-shield solves three related production problems:
+
+1. **SingleFlight** — When N concurrent callers request the same key, only one upstream call is made. All N callers share the resolved value. Prevents thundering-herd on cold cache or slow upstream.
+
+2. **StampedeShield** — SWR (stale-while-revalidate) cache layer with XFetch probabilistic early-expiry. Serves stale data instantly while exactly one background refresh runs. Supports `waitUntil` for serverless runtimes (Vercel, Cloudflare Workers, Next.js App Router), `shouldCache` predicate, dynamic `ttlMs`, and `softPurge` for stampede-safe invalidation.
+
+3. **BatchFlight** — Collects individual `.load(key)` calls within a configurable time window and fires one batched upstream call. Deduplicates keys, isolates per-item errors, supports both Array and Map responses.
+
+## Install
+
+```
+npm install flight-shield
+```
+
+## Quick usage
+
+```typescript
+import { singleFlight, StampedeShield, MemoryCacheAdapter, BatchFlight } from 'flight-shield';
+
+// 1. SingleFlight — deduplicate concurrent calls
+const user = await singleFlight.do(`user:${id}`, (signal) => db.getUser(id, signal));
+
+// 2. StampedeShield — SWR cache with stampede protection
+const shield = new StampedeShield(new MemoryCacheAdapter());
+const product = await shield.getOrSet(
+  `product:${id}`,
+  (signal) => db.getProduct(id, signal),
+  {
+    ttlMs: 30_000,
+    staleTtlMs: 120_000,
+    shouldCache: (val) => val !== null,          // skip caching null/miss results
+    ttlMs: (val) => val === null ? 5_000 : 30_000, // dynamic TTL based on value
+    waitUntil: ctx.waitUntil.bind(ctx),          // Cloudflare Workers / Next.js
+  }
+);
+
+// Stampede-safe invalidation after a mutation
+await db.updateProduct(id, data);
+await shield.softPurge(`product:${id}`);        // serves stale, refreshes once in background
+
+// 3. BatchFlight — coalesce individual loads into one batch call
+const users = new BatchFlight<number, User>(
+  async (ids, signal) => db.getUsers(ids, signal),
+  { maxBatchSize: 50, maxWindowMs: 10 }
+);
+const user = await users.load(userId);
+```
+
+## Key properties
+
+- Zero runtime dependencies
+- Full TypeScript, ESM + CJS with 100% type parity
+- Node.js >= 20
+- 63 regression tests covering race conditions, NaN traps, ABA races, timer leaks
+- MIT license
+
+## When to use
+
+- Use `singleFlight.do()` when you have an async function called concurrently with the same arguments and each call hitting the upstream is wasteful.
+- Use `StampedeShield` when you have a cache and want SWR semantics — serve stale, refresh once, never block.
+- Use `BatchFlight` when you have N+1 query patterns (e.g. GraphQL resolvers, REST handler calling a row lookup per item in a list).
+
+## When NOT to use
+
+- Write operations (INSERT, UPDATE, DELETE) — do not coalesce writes.
+- Distributed multi-pod environments without shared state — flight-shield is process-local. Pair with Redis for cross-pod coalescing.
+- Operations with per-caller side-effects (e.g. view-count increments).
+
+## Links
+
+- GitHub: https://github.com/mayankcodes-dev/flight-shield
+- npm: https://www.npmjs.com/package/flight-shield
+- Changelog: https://github.com/mayankcodes-dev/flight-shield/releases

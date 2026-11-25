@@ -41,10 +41,70 @@ export interface CacheAdapter<T> {
 }
 
 export interface ShieldOptions<T> extends FlightOptions<T> {
-  ttlMs?: number;
+  /**
+   * How long (ms) a freshly loaded value is considered valid.
+   *
+   * Accepts a **static number** or a **function** that receives the loaded
+   * value and returns a number.  Use the function form to implement
+   * conditional TTLs — e.g. cache a `null` miss for only 5 s while caching a
+   * real object for 5 min:
+   *
+   * ```ts
+   * ttlMs: (val) => val === null ? 5_000 : 300_000
+   * ```
+   *
+   * @default 60_000
+   */
+  ttlMs?: number | ((value: T) => number);
+
+  /** How long (ms) a stale value may still be served while a background
+   *  refresh is running.  Set to `0` to disable stale-while-revalidate.
+   * @default 0
+   */
   staleTtlMs?: number;
+
+  /**
+   * XFetch early-expiry aggressiveness.  Higher values trigger background
+   * refreshes earlier (before the TTL expires).  `0` disables early refresh.
+   * @default 1
+   */
   beta?: number;
+
+  /**
+   * Called when a background (stale-while-revalidate) refresh fails.
+   * If omitted, errors are silently swallowed so callers still receive stale data.
+   */
   onBackgroundError?: (error: unknown, key: string) => void | Promise<void>;
+
+  /**
+   * Predicate called **after** the loader resolves.  Return `false` to skip
+   * caching the result (e.g. cache misses, error sentinels, or partial data):
+   *
+   * ```ts
+   * shouldCache: (val) => val !== null
+   * ```
+   *
+   * When `false` is returned the value is still returned to the caller — it
+   * just never enters the cache, so the next call will invoke the loader again.
+   */
+  shouldCache?: (value: T) => boolean;
+
+  /**
+   * Serverless / edge-runtime hook.  Pass the platform's `waitUntil` function
+   * so that background SWR refreshes are kept alive after the HTTP response is
+   * sent.  Without this, runtimes like Vercel, Cloudflare Workers and
+   * Next.js App Router will kill the in-flight refresh promise:
+   *
+   * ```ts
+   * // Next.js App Router / Vercel
+   * import { unstable_after as waitUntil } from 'next/server';
+   * shield.getOrSet(key, loader, { waitUntil });
+   *
+   * // Cloudflare Workers
+   * shield.getOrSet(key, loader, { waitUntil: ctx.waitUntil.bind(ctx) });
+   * ```
+   */
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 interface MemoryEntry<T> {
@@ -53,13 +113,15 @@ interface MemoryEntry<T> {
 }
 
 interface NormalizedShieldOptions<T> {
-  ttlMs: number;
+  ttlMs: number | ((value: T) => number);
   staleTtlMs: number;
   beta: number;
   timeoutMs?: number;
   maxFlightWindowMs?: number;
   clone?: ShieldOptions<T>['clone'];
   onBackgroundError?: ShieldOptions<T>['onBackgroundError'];
+  shouldCache?: ShieldOptions<T>['shouldCache'];
+  waitUntil?: ShieldOptions<T>['waitUntil'];
 }
 
 const DEFAULT_TTL_MS = 60_000;
@@ -234,7 +296,13 @@ export class StampedeShield<T> {
     const staleTtlMs = options.staleTtlMs ?? DEFAULT_STALE_TTL_MS;
     const beta = options.beta ?? DEFAULT_BETA;
 
-    validateDuration('ttlMs', ttlMs);
+    // Static ttlMs is validated eagerly; function form is validated lazily in loadAndStore.
+    if (typeof ttlMs === 'number') {
+      validateDuration('ttlMs', ttlMs);
+    } else if (typeof ttlMs !== 'function') {
+      throw new TypeError('ttlMs must be a number or a function returning a number');
+    }
+
     validateDuration('staleTtlMs', staleTtlMs);
     validateDuration('timeoutMs', options.timeoutMs);
     validateDuration('maxFlightWindowMs', options.maxFlightWindowMs);
@@ -243,7 +311,7 @@ export class StampedeShield<T> {
       throw new RangeError('beta must be a finite, non-negative number');
     }
 
-    if (!Number.isFinite(ttlMs + staleTtlMs)) {
+    if (typeof ttlMs === 'number' && !Number.isFinite(ttlMs + staleTtlMs)) {
       throw new RangeError('ttlMs + staleTtlMs must be finite');
     }
 
@@ -255,6 +323,8 @@ export class StampedeShield<T> {
       maxFlightWindowMs: options.maxFlightWindowMs,
       clone: options.clone,
       onBackgroundError: options.onBackgroundError,
+      shouldCache: options.shouldCache,
+      waitUntil: options.waitUntil,
     };
   }
 
@@ -276,7 +346,26 @@ export class StampedeShield<T> {
     // Bug 2.2 fix: Clamp deltaMs to at least 1ms so XFetch never gets
     // 0 * Math.log(x) = NaN for sub-millisecond loaders.
     const deltaMs = Math.max(1, performance.now() - startedAt);
-    const expiry = Date.now() + options.ttlMs;
+
+    // shouldCache: skip writing to cache if predicate returns false.
+    // The value is still returned to the caller — just not stored.
+    if (options.shouldCache !== undefined && !options.shouldCache(value)) {
+      return value;
+    }
+
+    // Dynamic ttlMs: resolve the function form now that we have the value.
+    const resolvedTtlMs = typeof options.ttlMs === 'function'
+      ? options.ttlMs(value)
+      : options.ttlMs;
+
+    validateDuration('ttlMs (dynamic)', resolvedTtlMs);
+
+    // If dynamic ttlMs resolves to 0, skip caching (treat as "never cache").
+    if (resolvedTtlMs === 0) {
+      return value;
+    }
+
+    const expiry = Date.now() + resolvedTtlMs;
     const envelope: ShieldEnvelope<T> = {
       value,
       deltaMs,
@@ -284,8 +373,52 @@ export class StampedeShield<T> {
       staleExpiry: expiry + options.staleTtlMs,
     };
 
-    await this.cache.set(key, envelope, options.ttlMs + options.staleTtlMs);
+    await this.cache.set(key, envelope, resolvedTtlMs + options.staleTtlMs);
     return value;
+  }
+
+  /**
+   * Stampede-safe cache invalidation.
+   *
+   * Unlike `cache.delete(key)` — which removes the entry entirely and causes a
+   * thundering-herd on the next burst — `softPurge` zeroes out only the *fresh*
+   * window (`expiry = 0`) while leaving the *stale* window intact.
+   *
+   * Result: the **very next** `getOrSet` call finds the entry stale, triggers
+   * exactly **one** coalesced background refresh via `startBackgroundRefresh`,
+   * and immediately returns the stale value to all concurrent callers.
+   * No stampede. No blocking.
+   *
+   * Use this after a DB mutation instead of `cache.delete`:
+   *
+   * ```ts
+   * await db.updateProduct(id, data);
+   * await shield.softPurge(`product:${id}`);
+   * // next read returns stale instantly, refreshes once in background
+   * ```
+   */
+  async softPurge(key: string): Promise<void> {
+    const envelope = await this.cache.get(key);
+    if (envelope === null || envelope === undefined) {
+      return; // Nothing cached — no-op.
+    }
+
+    // Zero-out the fresh window so the entry is immediately stale,
+    // but keep staleExpiry alive so callers still get a value to serve.
+    const purged: ShieldEnvelope<T> = {
+      value: envelope.value,
+      deltaMs: envelope.deltaMs,
+      expiry: 0,                      // ← marks as stale immediately
+      staleExpiry: envelope.staleExpiry,
+    };
+
+    const remainingPxMs = Math.max(0, envelope.staleExpiry - Date.now());
+    if (remainingPxMs === 0) {
+      await this.cache.delete(key);
+      return;
+    }
+
+    await this.cache.set(key, purged, remainingPxMs);
   }
 
   private startBackgroundRefresh(
@@ -312,13 +445,20 @@ export class StampedeShield<T> {
       return;
     }
 
-    void refresh
+    const work = refresh
       .catch((error: unknown) =>
         this.reportBackgroundError(key, error, options.onBackgroundError),
       )
       .finally(() => {
         this.backgroundRefreshes.delete(key);
       });
+
+    // waitUntil: hand the promise to the platform (Vercel / Cloudflare Workers /
+    // Next.js App Router) so it stays alive after the HTTP response is sent.
+    // Without this, serverless runtimes kill the in-flight refresh immediately.
+    if (options.waitUntil !== undefined) {
+      options.waitUntil(work);
+    }
   }
 
   private async reportBackgroundError(
