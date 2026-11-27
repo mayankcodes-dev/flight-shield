@@ -62,8 +62,12 @@
     "dist",
     "README.md",
     "LICENSE",
+    "CHANGELOG.md",
     "AGENTS.md",
-    "llms.txt"
+    "llms.txt",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "tsup",
